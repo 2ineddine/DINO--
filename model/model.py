@@ -71,30 +71,90 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.):
         super().__init__()
+
+        # Number of attention heads
         self.num_heads = num_heads
+
+        # Dimension per head
+        # dim = num_heads * head_dim
         head_dim = dim // num_heads
+
+        # Scaling factor for dot-product attention
         self.scale = qk_scale or head_dim ** -0.5
 
+        # Linear layer to produce Q, K, V all at once
+        # Input:  (B, N, C)
+        # Output: (B, N, 3C)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+
         self.attn_drop = nn.Dropout(attn_drop)
+
+        # Final projection back to original feature dimension
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
+        # x shape: (B, N, C)
+        # B = batch size
+        # N = number of tokens (patches)
+        # C = embedding dimension
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        # Apply linear projection
+        # (B, N, C) -> (B, N, 3C)
+        qkv = self.qkv(x)
+
+        # Reshape to separate Q, K, V and heads
+        # (B, N, 3C) ->
+        # (B, N, 3, num_heads, head_dim)
+        qkv = qkv.reshape(
+            B, N, 3, self.num_heads, C // self.num_heads
+        )
+
+        # Permute to put QKV first
+        # (3, B, num_heads, N, head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+
+        # Split into query, key, value
+        # Each: (B, num_heads, N, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        # Compute attention scores
+        # k.transpose(-2, -1): (B, num_heads, head_dim, N)
+        # q @ k^T -> (B, num_heads, N, N)
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # Softmax over last dimension (keys)
         attn = attn.softmax(dim=-1)
+
+        # Dropout on attention weights
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Weighted sum of values
+        # (B, num_heads, N, N) @ (B, num_heads, N, head_dim)
+        # -> (B, num_heads, N, head_dim)
+        x = attn @ v
+
+        # Reorder and merge heads
+        # (B, num_heads, N, head_dim)
+        # -> (B, N, num_heads, head_dim)
+        # -> (B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        # Final linear projection
         x = self.proj(x)
+
+        # Output dropout
         x = self.proj_drop(x)
+
+        # Return:
+        # x:    (B, N, C)
+        # attn: (B, num_heads, N, N)
         return x, attn
+
 
 
 class Block(nn.Module):
@@ -149,11 +209,11 @@ class VisionTransformer(nn.Module):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
 
-        self.patch_embed = PatchEmbed(
+        self.patch_embed = PatchEmbed( # output size: (B, num_patches, embed_dim)
             img_size=img_size[0], patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) # shape of cls token: (1, 1, embed_dim) 0000
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -204,18 +264,61 @@ class VisionTransformer(nn.Module):
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
 
     def prepare_tokens(self, x):
+        """
+        Prepares input tokens for the Vision Transformer.
+
+        Steps:
+        1. Convert images into patch embeddings
+        2. Prepend the CLS token
+        3. Add positional embeddings
+        4. Apply dropout for regularization
+
+        Input:
+            x: Tensor of shape (B, C_in, H, W)
+            B = batch size
+            C_in = input channels (1 for grayscale, 3 for RGB)
+            H, W = image height and width
+        Output:
+            tokens: Tensor of shape (B, N+1, embed_dim)
+                    N = number of patch tokens
+                    +1 = CLS token
+        """
+
+        # Extract batch size and image dimensions
         B, nc, w, h = x.shape
-        # X (B, nc, w, h) after patch embedding -> (B, num_patches, embed_dim)
-        x = self.patch_embed(x)  # patch linear embedding
+        # B = batch size
+        # nc = input channels
+        # w, h = width and height of the input image
 
-        # add the [CLS] token to the embed patch tokens
+        # Convert image to patch embeddings
+        # PatchEmbed splits image into patches, flattens each patch, and projects it to embed_dim
+        # Input:  x -> (B, nc, w, h)
+        # Output: x -> (B, N, embed_dim), where N = number of patches
+        x = self.patch_embed(x)
+
+        # Create CLS token for each batch element
+        # self.cls_token has shape (1, 1, embed_dim)
+        # We expand it to match batch size B
         cls_tokens = self.cls_token.expand(B, -1, -1)
+        # cls_tokens shape -> (B, 1, embed_dim)
+
+        # Prepend CLS token to patch embeddings
+        # Concatenate along the token (sequence) dimension
         x = torch.cat((cls_tokens, x), dim=1)
+        # x shape -> (B, N+1, embed_dim)
 
-        # add positional encoding to each token
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        # Add positional embeddings
+        # Each token receives a positional encoding to retain spatial information
+        # interpolate_pos_encoding adjusts positional embeddings for image size if needed
+        x = x + self.interpolate_pos_encoding(x, w, h) # patch embeddings + pos embeddings      
+        # x shape remains -> (B, N+1, embed_dim)
 
-        return self.pos_drop(x)
+        # Apply dropout for regularization
+        # Dropout randomly zeroes some token embeddings to prevent overfitting
+        x = self.pos_drop(x)
+        # final output shape -> (B, N+1, embed_dim)
+
+        return x
 
     def forward(self, x):
         x = self.prepare_tokens(x)
@@ -313,9 +416,12 @@ class DINOHead(nn.Module):
 
 
 
-# test the drop_path function
+# the test of the full model
 if __name__ == "__main__":
-    x = torch.randn(2,3,4,5)
-    #print("input:", x)
-    out = drop_path(x, drop_prob=0.5, training=True)
-    print("output:", out[1,2,:,:])
+    backbone = vit_base(patch_size=16, img_size=[128])
+    DINO = DINOHead(in_dim=backbone.embed_dim, out_dim=65536, nlayers=3)
+    img = torch.randn(1, 1, 128, 128)
+    feat = backbone(img)
+    print("feat shape:", feat.shape)
+    out = DINO(feat)
+    print("out shape:", out.shape)
