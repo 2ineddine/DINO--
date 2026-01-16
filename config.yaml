@@ -1,0 +1,41 @@
+# Minimal DINO Training Configuration
+
+# Model parameters
+arch: 'vit_small'
+patch_size: 16
+out_dim: 65536
+norm_last_layer: True
+momentum_teacher: 0.996
+use_bn_in_head: False
+
+# Temperature parameters
+warmup_teacher_temp: 0.04
+teacher_temp: 0.04
+warmup_teacher_temp_epochs: 0
+
+# Training parameters
+use_fp16: True
+weight_decay: 0.04
+weight_decay_end: 0.4
+clip_grad: 3.0
+batch_size_per_gpu: 64
+epochs: 100
+freeze_last_layer: 1
+lr: 0.0005
+warmup_epochs: 10
+min_lr: 1e-6
+optimizer: 'adamw'
+drop_path_rate: 0.1
+
+# Multi-crop parameters
+global_crops_scale: [0.4, 1.0]
+local_crops_number: 8
+local_crops_scale: [0.05, 0.4]
+
+# Data and misc
+data_path: '/path/to/imagenet/train/'
+output_dir: '.'
+saveckp_freq: 20
+seed: 0
+num_workers: 10
+dist_url: 'env://'
