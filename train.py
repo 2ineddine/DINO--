@@ -19,6 +19,7 @@ import time
 import math
 import json
 from pathlib import Path
+import wandb
 
 import numpy as np
 from PIL import Image
@@ -27,9 +28,11 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torchvision import datasets, transforms
+from torchvision.transforms import v2 as transforms
+from torchvision import datasets#, transforms
 from torchvision import models as torchvision_models
 
+from data.data_loader import get_dataloader
 import utils
 import model.model as vits
 from model.model import DINOHead
@@ -89,7 +92,7 @@ def get_args_parser():
         help optimization for larger ViT architectures. 0 for disabling.""")
     parser.add_argument('--batch_size_per_gpu', default=64, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
+    parser.add_argument('--epochs', default=300, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
@@ -130,7 +133,15 @@ def get_args_parser():
 
 
 def train_dino(args):
+    
+    
     utils.init_distributed_mode(args)
+    if utils.is_main_process():
+        wandb.init(
+            project="dino-training",
+            config=vars(args),
+            name=f"run_{args.arch}_bs{args.batch_size_per_gpu}"
+        )
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
@@ -157,6 +168,8 @@ def train_dino(args):
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
+    
+    
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
     if args.arch in vits.__dict__.keys():
         student = vits.__dict__[args.arch](
@@ -165,19 +178,12 @@ def train_dino(args):
         )
         teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
         embed_dim = student.embed_dim
-    # if the network is a XCiT
-    elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
-        student = torch.hub.load('facebookresearch/xcit:main', args.arch,
-                                 pretrained=False, drop_path_rate=args.drop_path_rate)
-        teacher = torch.hub.load('facebookresearch/xcit:main', args.arch, pretrained=False)
-        embed_dim = student.embed_dim
-    # otherwise, we check if the architecture is in torchvision models
-    elif args.arch in torchvision_models.__dict__.keys():
-        student = torchvision_models.__dict__[args.arch]()
-        teacher = torchvision_models.__dict__[args.arch]()
-        embed_dim = student.fc.weight.shape[1]
+    
     else:
         print(f"Unknow architecture: {args.arch}")
+
+
+
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(student, DINOHead(
@@ -192,6 +198,8 @@ def train_dino(args):
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
+    
+    
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
@@ -200,9 +208,13 @@ def train_dino(args):
         # we need DDP wrapper to have synchro batch norms working...
         teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
+        
+        
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
+        
+        
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
@@ -296,6 +308,8 @@ def train_dino(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if utils.is_main_process():
+        wandb.finish()
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
@@ -334,6 +348,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
+            if utils.is_main_process() and it % 100 == 0:
+                wandb.log({
+                    "batch/loss": loss.item(),
+                    "batch/iteration": it,
+                })
         else:
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
@@ -358,7 +377,17 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    if utils.is_main_process():
+        wandb.log({
+            "train/loss": metric_logger.meters['loss'].global_avg,
+            "train/lr": metric_logger.meters['lr'].global_avg,
+            "train/wd": metric_logger.meters['wd'].global_avg,
+            "epoch": epoch
+        })
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+
 
 
 class DINOLoss(nn.Module):
@@ -381,8 +410,16 @@ class DINOLoss(nn.Module):
     def forward(self, student_output, teacher_output, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
+        student_output: NxC tensor (N: number of crops * batch_size, C: output dim)
+        teacher_output: 2xNxC tensor (2 global crops only)
+        we compute the cross-entropy in feature returned for each example 
+        
+        if we use the batches the sizes would be :
+        student_output: (batch_size * ncrops, out_dim)
+        teacher_output: (2 * batch_size, out_dim)
+        
         """
-        student_out = student_output / self.student_temp
+        student_out = student_output / self.student_temp   # we devide all the probabilities by the temperature
         student_out = student_out.chunk(self.ncrops)
 
         # teacher centering and sharpening
@@ -417,8 +454,19 @@ class DINOLoss(nn.Module):
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
+
+       
 class DataAugmentationDINO(object):
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
+        """
+        this function will make the data augmentation of the initial images, and for each image 
+        it generate local crop of about 40% to 100% of the size of the image and then stretch them to 
+        the size of 224x224, and also generate local crops of about 5% to 40% of the size of the image
+        and resize it to (96,96)
+
+        the number of each crote is specified, curretly in the code is about 2 global crops 
+        and 8 local crops
+        """
         flip_and_color_jitter = transforms.Compose([
             transforms.Grayscale(num_output_channels=1),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -459,16 +507,33 @@ class DataAugmentationDINO(object):
         ])
 
     def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
-        for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+            crops = []
+            
+            # Global crop 1
+            crop1 = self.global_transfo1(image)
+            crop1 = self.amplitude_jitter(crop1)
+            crops.append(crop1)
+            
+            # Global crop 2 with SpecAugment
+            crop2 = self.global_transfo2(image)
+            crop2 = self.spec_augment(crop2)
+            crop2 = self.amplitude_jitter(crop2)
+            crop2 = self.gaussian_noise(crop2)
+            crops.append(crop2)
+            
+            # Local crops
+            for _ in range(self.local_crops_number):
+                local = self.local_transfo(image)
+                if random.random() > 0.5:
+                    local = self.spec_augment(local)
+                crops.append(local)
+            
+            return crops
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
-    args = parser.parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_dino(args)
+# if __name__ == '__main__':
+#     parser = argparse.ArgumentParser('DINO', parents=[get_args_parser()])
+#     args = parser.parse_args()
+#     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+#     train_dino(args)
+
