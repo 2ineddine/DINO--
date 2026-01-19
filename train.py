@@ -11,6 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""
+CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.launch \
+    --nproc_per_node=3 \
+    main_dino.py \
+    --arch vit_small \
+    --patch_size 16 \
+    --data_path /srv/shared/spectrograms/train \
+    --output_dir /srv/shared/models/dino_run1 \
+    --epochs 100 \
+    --batch_size_per_gpu 32 \
+    --lr 0.0001 \
+    --warmup_epochs 5 \
+    --use_fp16 false \
+    --saveckp_freq 10
+    
+    
+    """
 import argparse
 import os
 import sys
@@ -80,7 +98,7 @@ def get_args_parser():
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
-    parser.add_argument('--use_fp16', type=utils.bool_flag, default=True, help="""Whether or not
+    parser.add_argument('--use_fp16', type=utils.bool_flag, default=False, help="""Whether or not
         to use half precision for training. Improves training time and memory requirements,
         but can provoke instability and slight decay of performance. We recommend disabling
         mixed precision if the loss is unstable, if reducing the patch size or if training with bigger ViTs.""")
@@ -92,16 +110,16 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=32, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
-    parser.add_argument('--epochs', default=300, type=int, help='Number of epochs of training.')
+    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
-    parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
+    parser.add_argument("--lr", default=0.0001, type=float, help="""Learning rate at the end of
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
-    parser.add_argument("--warmup_epochs", default=10, type=int,
+    parser.add_argument("--warmup_epochs", default=5, type=int,
         help="Number of epochs for the linear learning-rate warm up.")
     parser.add_argument('--min_lr', type=float, default=1e-6, help="""Target LR at the
         end of optimization. We use a cosine LR schedule with linear warmup.""")
@@ -110,19 +128,19 @@ def get_args_parser():
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
 
     # Multi-crop parameters
-    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
+    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.5, 1.),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
     parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
-    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
+    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.1, 0.5),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
+    parser.add_argument('--data_path', default='/srv/shared/ecosurf/2019spect/downloaded_data', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
@@ -138,7 +156,6 @@ def train_dino(args):
     
     
     utils.init_distributed_mode(args)
-    args.gpu = args.local_rank
     if utils.is_main_process():
         wandb.init(
             project="dino-training",
@@ -506,7 +523,7 @@ class DataAugmentationDINO(nn.Module):
         
         # Global crop 1 pipeline
         self.global_transfo1 = K.AugmentationSequential(
-            K.RandomResizedCrop(size=(224, 384), scale=global_crops_scale, resample='bicubic'),
+            K.RandomResizedCrop(size=(224, 352), scale=global_crops_scale, resample='bicubic'),
             K.RandomHorizontalFlip(p=0.5),
             AmplitudeJitter(),
             K.RandomGaussianBlur(kernel_size=(23, 23), sigma=(0.1, 2.0), p=1.0),
@@ -515,7 +532,7 @@ class DataAugmentationDINO(nn.Module):
         
         # Global crop 2 pipeline (with more augmentations)
         self.global_transfo2 = K.AugmentationSequential(
-            K.RandomResizedCrop(size=(224, 384), scale=global_crops_scale, resample='bicubic'),
+            K.RandomResizedCrop(size=(224, 352), scale=global_crops_scale, resample='bicubic'),
             K.RandomHorizontalFlip(p=0.5),
             SpecAugment(),
             AmplitudeJitter(),
@@ -527,7 +544,7 @@ class DataAugmentationDINO(nn.Module):
         
         # Local crops pipeline
         self.local_transfo = K.AugmentationSequential(
-            K.RandomResizedCrop(size=(96, 168), scale=local_crops_scale, resample='bicubic'),
+            K.RandomResizedCrop(size=(96, 160), scale=local_crops_scale, resample='bicubic'),
             K.RandomHorizontalFlip(p=0.5),
             SpecAugment(),
             AmplitudeJitter(),

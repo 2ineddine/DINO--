@@ -25,7 +25,7 @@ import random
 import datetime
 import subprocess
 from collections import defaultdict, deque
-
+import argparse
 import numpy as np
 import torch
 from torch import nn
@@ -44,13 +44,13 @@ class SpecAugment(nn.Module):
             x = x.squeeze(0)
         
         # Frequency masking - scale to 5-10% of height
-        if random.random() > 0.3:
-            f_mask = random.randint(int(x.shape[1]*0.05), int(x.shape[1]*0.15))  # 5-15% of freq bins
+        if random.random() > 0.5:
+            f_mask = random.randint(int(x.shape[1]*0.01), int(x.shape[1]*0.1))  # 5-15% of freq bins
             f0 = random.randint(0, max(0, x.shape[1] - f_mask))
             x[:, f0:f0+f_mask, :] = 0
         
         # Time masking - scale to 5-15% of width
-        if random.random() > 0.3:
+        if random.random() > 0.5:
             t_mask = random.randint(int(x.shape[2]*0.06), int(x.shape[2]*0.15))  # 6-15% of time
             t0 = random.randint(0, max(0, x.shape[2] - t_mask))
             x[:, :, t0:t0+t_mask] = 0
@@ -61,15 +61,15 @@ class AmplitudeJitter(nn.Module):
     def forward(self, x):
         if x.dim() == 4:
             x = x.squeeze(0)
-        scale = random.uniform(0.3, 2.0)
+        scale = random.uniform(0.5, 1.5)
         return torch.clamp(x * scale, 0, 1)
 
 class AddGaussianNoise(nn.Module):
     def forward(self, x):
         if x.dim() == 4:
             x = x.squeeze(0)    
-        if random.random() > 0.4:
-            noise = torch.randn_like(x) * random.uniform(0.02, 0.1)
+        if random.random() > 0.6:
+            noise = torch.randn_like(x) * random.uniform(0.01, 0.05)
             return torch.clamp(x + noise, 0, 1)
         return x
 
@@ -77,8 +77,8 @@ class AddSparseNoise(nn.Module):
     def forward(self, x):
         if x.dim() == 4:
             x = x.squeeze(0)
-        if random.random() > 0.5:
-            num_points = random.randint(50, 200)
+        if random.random() > 0.6:
+            num_points = random.randint(20, 80)
             for _ in range(num_points):
                 h, w = random.randint(0, x.shape[1]-1), random.randint(0, x.shape[2]-1)
                 x[:, h, w] = random.uniform(0.7, 1.0)
