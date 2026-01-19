@@ -16,11 +16,12 @@ import os
 import sys
 import datetime
 import time
+from torchvision.transforms import ToTensor
 import math
 import json
 from pathlib import Path
 import wandb
-
+from utils import SpecAugment, AmplitudeJitter, AddGaussianNoise, AddSparseNoise
 import numpy as np
 from PIL import Image
 import torch
@@ -36,6 +37,7 @@ from data.data_loader import get_dataloader
 import utils
 import model.model as vits
 from model.model import DINOHead
+import kornia.augmentation as K
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -136,6 +138,7 @@ def train_dino(args):
     
     
     utils.init_distributed_mode(args)
+    args.gpu = args.local_rank
     if utils.is_main_process():
         wandb.init(
             project="dino-training",
@@ -148,13 +151,42 @@ def train_dino(args):
     cudnn.benchmark = True
 
     # ============ preparing data ... ============
+    
+    # create an object to augment the data
     transform = DataAugmentationDINO(
         args.global_crops_scale,
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    
+    # it return the data augmented (list_of_10 crops,labels) [crop1,crop2 ...] len(crop1) = 10,
+    # len (dataset ) = the total number of spectrogram 
+    dataset = datasets.ImageFolder(args.data_path, transform=transform) 
+    
+    
+    # distribute the images on GPUs (distribute the indices on the GPUs ! )
+    #return an iterable object that contains the indices of the dataset for each GPU / or for the current GPU (to verify)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
+    
+    
+    # it return an iterable object 
+    """
+    for example we'd a batch size 64
+    images = [
+    tensor (64, 1, 224, 224),  # Global crop 1
+    tensor (64, 1, 224, 224),  # Global crop 2
+    tensor (64, 1, 96, 96),    # Local crop 1
+    tensor (64, 1, 96, 96),    # Local crop 2
+    tensor (64, 1, 96, 96),    # Local crop 3
+    tensor (64, 1, 96, 96),    # Local crop 4
+    tensor (64, 1, 96, 96),    # Local crop 5
+    tensor (64, 1, 96, 96),    # Local crop 6
+    tensor (64, 1, 96, 96),    # Local crop 7
+    tensor (64, 1, 96, 96),    # Local crop 8
+]  # Total: 10 tensors (list)
+
+    
+    """
     data_loader = torch.utils.data.DataLoader(
         dataset,
         sampler=sampler,
@@ -456,79 +488,88 @@ class DINOLoss(nn.Module):
 
 
        
-class DataAugmentationDINO(object):
+class DataAugmentationDINO(nn.Module):
+    """
+    this function will make the data augmentation of the initial images, and for each image 
+    it generate local crop of about 40% to 100% of the size of the image and then stretch them to 
+    the size of 224x224, and also generate local crops of about 5% to 40% of the size of the image
+    and resize it to (96,96)
+
+    the number of each crote is specified, curretly in the code is about 2 global crops 
+    and 8 local crops
+    """
     def __init__(self, global_crops_scale, local_crops_scale, local_crops_number):
-        """
-        this function will make the data augmentation of the initial images, and for each image 
-        it generate local crop of about 40% to 100% of the size of the image and then stretch them to 
-        the size of 224x224, and also generate local crops of about 5% to 40% of the size of the image
-        and resize it to (96,96)
-
-        the number of each crote is specified, curretly in the code is about 2 global crops 
-        and 8 local crops
-        """
-        flip_and_color_jitter = transforms.Compose([
-            transforms.Grayscale(num_output_channels=1),
-            transforms.RandomHorizontalFlip(p=0.5),
-            #transforms.RandomApply(
-                #[transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                #p=0.8
-            #),
-            #transforms.RandomGrayscale(p=0.2),
-        ])
-        normalize = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, ), (0.5, )),
-            #transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-        ])
-
-        # first global crop
-        self.global_transfo1 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(1.0),
-            normalize,
-        ])
-        # second global crop
-        self.global_transfo2 = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=global_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(0.1),
-            utils.Solarization(0.2),
-            normalize,
-        ])
-        # transformation for the local small crops
+        super().__init__()
         self.local_crops_number = local_crops_number
-        self.local_transfo = transforms.Compose([
-            transforms.RandomResizedCrop(96, scale=local_crops_scale, interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            utils.GaussianBlur(p=0.5),
-            normalize,
-        ])
+        
+        # Import augmentation classes from utils
+        
+        # Global crop 1 pipeline
+        self.global_transfo1 = K.AugmentationSequential(
+            K.RandomResizedCrop(size=(224, 384), scale=global_crops_scale, resample='bicubic'),
+            K.RandomHorizontalFlip(p=0.5),
+            AmplitudeJitter(),
+            K.RandomGaussianBlur(kernel_size=(23, 23), sigma=(0.1, 2.0), p=1.0),
+            data_keys=["input"]
+        )
+        
+        # Global crop 2 pipeline (with more augmentations)
+        self.global_transfo2 = K.AugmentationSequential(
+            K.RandomResizedCrop(size=(224, 384), scale=global_crops_scale, resample='bicubic'),
+            K.RandomHorizontalFlip(p=0.5),
+            SpecAugment(),
+            AmplitudeJitter(),
+            AddGaussianNoise(),
+            AddSparseNoise(),
+            K.RandomGaussianBlur(kernel_size=(23, 23), sigma=(0.1, 2.0), p=0.1),
+            data_keys=["input"]
+        )
+        
+        # Local crops pipeline
+        self.local_transfo = K.AugmentationSequential(
+            K.RandomResizedCrop(size=(96, 168), scale=local_crops_scale, resample='bicubic'),
+            K.RandomHorizontalFlip(p=0.5),
+            SpecAugment(),
+            AmplitudeJitter(),
+            K.RandomGaussianBlur(kernel_size=(23, 23), sigma=(0.1, 2.0), p=0.5),
+            data_keys=["input"]
+        )
+        
+        # Normalization (applied after all augmentations)
+        self.normalize = K.Normalize(mean=torch.tensor([0.5]), std=torch.tensor([0.5]))
 
-    def __call__(self, image):
-            crops = []
+    def forward(self, image):
             
-            # Global crop 1
-            crop1 = self.global_transfo1(image)
-            crop1 = self.amplitude_jitter(crop1)
-            crops.append(crop1)
-            
-            # Global crop 2 with SpecAugment
-            crop2 = self.global_transfo2(image)
-            crop2 = self.spec_augment(crop2)
-            crop2 = self.amplitude_jitter(crop2)
-            crop2 = self.gaussian_noise(crop2)
-            crops.append(crop2)
-            
-            # Local crops
-            for _ in range(self.local_crops_number):
-                local = self.local_transfo(image)
-                if random.random() > 0.5:
-                    local = self.spec_augment(local)
-                crops.append(local)
-            
-            return crops
+        image = ToTensor()(image)
+        
+        # Ensure grayscale (1 channel)
+        if image.shape[0] == 3:
+            image = K.Grayscale()(image.unsqueeze(0)).squeeze(0)
+        elif image.shape[0] != 1:
+            image = image.mean(dim=0, keepdim=True)
+        
+        # Add batch dimension for Kornia (expects B,C,H,W)
+        image = image.unsqueeze(0)
+        
+        crops = []
+        
+        # Global crop 1
+        crop1 = self.global_transfo1(image)
+        crop1 = self.normalize(crop1)
+        crops.append(crop1.squeeze(0))  # Remove batch dim
+        
+        # Global crop 2
+        crop2 = self.global_transfo2(image)
+        crop2 = self.normalize(crop2)
+        crops.append(crop2.squeeze(0))
+        
+        # Local crops
+        for _ in range(self.local_crops_number):
+            local = self.local_transfo(image)
+            local = self.normalize(local)
+            crops.append(local.squeeze(0))
+        
+        return crops
 
 
 # if __name__ == '__main__':

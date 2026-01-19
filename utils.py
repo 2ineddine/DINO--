@@ -30,37 +30,44 @@ import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
-
-
 import kornia.augmentation as K
-import torch
+
+
+
 
 class SpecAugment(nn.Module):
     def __init__(self):
         super().__init__()
         
     def forward(self, x):
-        # x is tensor (C, H, W)
+        if x.dim() == 4:
+            x = x.squeeze(0)
+        
+        # Frequency masking - scale to 5-10% of height
         if random.random() > 0.3:
-            # Frequency masking
-            f_mask = random.randint(40, 80)
+            f_mask = random.randint(int(x.shape[1]*0.05), int(x.shape[1]*0.15))  # 5-15% of freq bins
             f0 = random.randint(0, max(0, x.shape[1] - f_mask))
             x[:, f0:f0+f_mask, :] = 0
+        
+        # Time masking - scale to 5-15% of width
         if random.random() > 0.3:
-            # Time masking
-            t_mask = random.randint(60, 120)
+            t_mask = random.randint(int(x.shape[2]*0.06), int(x.shape[2]*0.15))  # 6-15% of time
             t0 = random.randint(0, max(0, x.shape[2] - t_mask))
             x[:, :, t0:t0+t_mask] = 0
+        
         return x
 
 class AmplitudeJitter(nn.Module):
     def forward(self, x):
+        if x.dim() == 4:
+            x = x.squeeze(0)
         scale = random.uniform(0.3, 2.0)
         return torch.clamp(x * scale, 0, 1)
 
 class AddGaussianNoise(nn.Module):
     def forward(self, x):
+        if x.dim() == 4:
+            x = x.squeeze(0)    
         if random.random() > 0.4:
             noise = torch.randn_like(x) * random.uniform(0.02, 0.1)
             return torch.clamp(x + noise, 0, 1)
@@ -68,46 +75,14 @@ class AddGaussianNoise(nn.Module):
 
 class AddSparseNoise(nn.Module):
     def forward(self, x):
+        if x.dim() == 4:
+            x = x.squeeze(0)
         if random.random() > 0.5:
             num_points = random.randint(50, 200)
             for _ in range(num_points):
                 h, w = random.randint(0, x.shape[1]-1), random.randint(0, x.shape[2]-1)
                 x[:, h, w] = random.uniform(0.7, 1.0)
         return x
-
-class GaussianBlur(object):
-    """
-    Apply Gaussian Blur to the PIL image.
-    """
-    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.):
-        self.prob = p
-        self.radius_min = radius_min
-        self.radius_max = radius_max
-
-    def __call__(self, img):
-        do_it = random.random() <= self.prob
-        if not do_it:
-            return img
-
-        return img.filter(
-            ImageFilter.GaussianBlur(
-                radius=random.uniform(self.radius_min, self.radius_max)
-            )
-        )
-
-
-class Solarization(object):
-    """
-    Apply Solarization to the PIL image.
-    """
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return ImageOps.solarize(img)
-        else:
-            return img
 
 
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
@@ -150,25 +125,6 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
         else:
             print("There is no reference weights available for this model => We use random weights.")
 
-
-def load_pretrained_linear_weights(linear_classifier, model_name, patch_size):
-    url = None
-    if model_name == "vit_small" and patch_size == 16:
-        url = "dino_deitsmall16_pretrain/dino_deitsmall16_linearweights.pth"
-    elif model_name == "vit_small" and patch_size == 8:
-        url = "dino_deitsmall8_pretrain/dino_deitsmall8_linearweights.pth"
-    elif model_name == "vit_base" and patch_size == 16:
-        url = "dino_vitbase16_pretrain/dino_vitbase16_linearweights.pth"
-    elif model_name == "vit_base" and patch_size == 8:
-        url = "dino_vitbase8_pretrain/dino_vitbase8_linearweights.pth"
-    elif model_name == "resnet50":
-        url = "dino_resnet50_pretrain/dino_resnet50_linearweights.pth"
-    if url is not None:
-        print("We load the reference pretrained linear weights.")
-        state_dict = torch.hub.load_state_dict_from_url(url="https://dl.fbaipublicfiles.com/dino/" + url)["state_dict"]
-        linear_classifier.load_state_dict(state_dict, strict=True)
-    else:
-        print("We use random linear weights.")
 
 
 def clip_gradients(model, clip):
@@ -324,32 +280,6 @@ class SmoothedValue(object):
             max=self.max,
             value=self.value)
 
-
-def reduce_dict(input_dict, average=True):
-    """
-    Args:
-        input_dict (dict): all the values will be reduced
-        average (bool): whether to do average or sum
-    Reduce the values in the dictionary from all processes so that all processes
-    have the averaged results. Returns a dict with the same fields as
-    input_dict, after reduction.
-    """
-    world_size = get_world_size()
-    if world_size < 2:
-        return input_dict
-    with torch.no_grad():
-        names = []
-        values = []
-        # sort the keys so that they are consistent across processes
-        for k in sorted(input_dict.keys()):
-            names.append(k)
-            values.append(input_dict[k])
-        values = torch.stack(values, dim=0)
-        dist.all_reduce(values)
-        if average:
-            values /= world_size
-        reduced_dict = {k: v for k, v in zip(names, values)}
-    return reduced_dict
 
 
 class MetricLogger(object):
@@ -691,181 +621,3 @@ def has_batchnorms(model):
         if isinstance(module, bn_types):
             return True
     return False
-
-
-class PCA():
-    """
-    Class to  compute and apply PCA.
-    """
-    def __init__(self, dim=256, whit=0.5):
-        self.dim = dim
-        self.whit = whit
-        self.mean = None
-
-    def train_pca(self, cov):
-        """
-        Takes a covariance matrix (np.ndarray) as input.
-        """
-        d, v = np.linalg.eigh(cov)
-        eps = d.max() * 1e-5
-        n_0 = (d < eps).sum()
-        if n_0 > 0:
-            d[d < eps] = eps
-
-        # total energy
-        totenergy = d.sum()
-
-        # sort eigenvectors with eigenvalues order
-        idx = np.argsort(d)[::-1][:self.dim]
-        d = d[idx]
-        v = v[:, idx]
-
-        print("keeping %.2f %% of the energy" % (d.sum() / totenergy * 100.0))
-
-        # for the whitening
-        d = np.diag(1. / d**self.whit)
-
-        # principal components
-        self.dvt = np.dot(d, v.T)
-
-    def apply(self, x):
-        # input is from numpy
-        if isinstance(x, np.ndarray):
-            if self.mean is not None:
-                x -= self.mean
-            return np.dot(self.dvt, x.T).T
-
-        # input is from torch and is on GPU
-        if x.is_cuda:
-            if self.mean is not None:
-                x -= torch.cuda.FloatTensor(self.mean)
-            return torch.mm(torch.cuda.FloatTensor(self.dvt), x.transpose(0, 1)).transpose(0, 1)
-
-        # input if from torch, on CPU
-        if self.mean is not None:
-            x -= torch.FloatTensor(self.mean)
-        return torch.mm(torch.FloatTensor(self.dvt), x.transpose(0, 1)).transpose(0, 1)
-
-
-def compute_ap(ranks, nres):
-    """
-    Computes average precision for given ranked indexes.
-    Arguments
-    ---------
-    ranks : zerro-based ranks of positive images
-    nres  : number of positive images
-    Returns
-    -------
-    ap    : average precision
-    """
-
-    # number of images ranked by the system
-    nimgranks = len(ranks)
-
-    # accumulate trapezoids in PR-plot
-    ap = 0
-
-    recall_step = 1. / nres
-
-    for j in np.arange(nimgranks):
-        rank = ranks[j]
-
-        if rank == 0:
-            precision_0 = 1.
-        else:
-            precision_0 = float(j) / rank
-
-        precision_1 = float(j + 1) / (rank + 1)
-
-        ap += (precision_0 + precision_1) * recall_step / 2.
-
-    return ap
-
-
-def compute_map(ranks, gnd, kappas=[]):
-    """
-    Computes the mAP for a given set of returned results.
-         Usage:
-           map = compute_map (ranks, gnd)
-                 computes mean average precsion (map) only
-           map, aps, pr, prs = compute_map (ranks, gnd, kappas)
-                 computes mean average precision (map), average precision (aps) for each query
-                 computes mean precision at kappas (pr), precision at kappas (prs) for each query
-         Notes:
-         1) ranks starts from 0, ranks.shape = db_size X #queries
-         2) The junk results (e.g., the query itself) should be declared in the gnd stuct array
-         3) If there are no positive images for some query, that query is excluded from the evaluation
-    """
-
-    map = 0.
-    nq = len(gnd) # number of queries
-    aps = np.zeros(nq)
-    pr = np.zeros(len(kappas))
-    prs = np.zeros((nq, len(kappas)))
-    nempty = 0
-
-    for i in np.arange(nq):
-        qgnd = np.array(gnd[i]['ok'])
-
-        # no positive images, skip from the average
-        if qgnd.shape[0] == 0:
-            aps[i] = float('nan')
-            prs[i, :] = float('nan')
-            nempty += 1
-            continue
-
-        try:
-            qgndj = np.array(gnd[i]['junk'])
-        except:
-            qgndj = np.empty(0)
-
-        # sorted positions of positive and junk images (0 based)
-        pos  = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgnd)]
-        junk = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgndj)]
-
-        k = 0;
-        ij = 0;
-        if len(junk):
-            # decrease positions of positives based on the number of
-            # junk images appearing before them
-            ip = 0
-            while (ip < len(pos)):
-                while (ij < len(junk) and pos[ip] > junk[ij]):
-                    k += 1
-                    ij += 1
-                pos[ip] = pos[ip] - k
-                ip += 1
-
-        # compute ap
-        ap = compute_ap(pos, len(qgnd))
-        map = map + ap
-        aps[i] = ap
-
-        # compute precision @ k
-        pos += 1 # get it to 1-based
-        for j in np.arange(len(kappas)):
-            kq = min(max(pos), kappas[j]); 
-            prs[i, j] = (pos <= kq).sum() / kq
-        pr = pr + prs[i, :]
-
-    map = map / (nq - nempty)
-    pr = pr / (nq - nempty)
-
-    return map, aps, pr, prs
-
-
-def multi_scale(samples, model):
-    v = None
-    for s in [1, 1/2**(1/2), 1/2]:  # we use 3 different scales
-        if s == 1:
-            inp = samples.clone()
-        else:
-            inp = nn.functional.interpolate(samples, scale_factor=s, mode='bilinear', align_corners=False)
-        feats = model(inp).clone()
-        if v is None:
-            v = feats
-        else:
-            v += feats
-    v /= 3
-    v /= v.norm()
-    return v
